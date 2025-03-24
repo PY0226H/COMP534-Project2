@@ -5,10 +5,11 @@
  * - Uses drand48_r() for thread-safe random number generation.
  * - Single parallel region for improved performance (avoids
  *   repeated creation/teardown of parallel teams).
- * - Uses pointer arithmetic, restrict qualifiers, and SIMD
- *   directives to optimize the inner loops.
- * - Performs pivot search reduction and trailing submatrix update
- *   efficiently while conforming to the project requirements.
+ * - Uses pointer arithmetic and the restrict qualifier to help
+ *   the compiler with aliasing.
+ * - Introduces blocking (tiling) in the trailing submatrix update
+ *   to improve cache locality and overall performance.
+ * - Conforms with the project requirements.
  *************************************************************/
 
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 #include <omp.h>
 #include <numa.h>
 
@@ -46,13 +48,10 @@ double* generate_random_matrix(int n, int nthreads) {
         exit(EXIT_FAILURE);
     }
 
-    // Parallel initialization with thread-local random state
     #pragma omp parallel num_threads(nthreads)
     {
         struct drand48_data randBuf;
-        // Seed each thread's generator differently
         srand48_r(2023 + 37 * omp_get_thread_num(), &randBuf);
-
         #pragma omp for schedule(static)
         for (int i = 0; i < n*n; i++) {
             double x;
@@ -77,13 +76,11 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
         std::cerr << "ERROR: could not allocate memory for PA.\n";
         exit(EXIT_FAILURE);
     }
-    // Form PA = P*A using the pivot vector.
     for (int i = 0; i < n; i++) {
         int srcRow = piv[i];
         memcpy(&PA[(long)i * n], &Aorig[(long)srcRow * n], n * sizeof(double));
     }
 
-    // Compute R = PA - L*U.
     double *R = (double*) calloc((size_t)n * n, sizeof(double));
     if (!R) {
         std::cerr << "ERROR: could not allocate memory for R.\n";
@@ -99,7 +96,6 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
         }
     }
 
-    // Compute L2,1 norm = sum of Euclidean norms of columns.
     double l21 = 0.0;
     for (int j = 0; j < n; j++) {
         double sumSq = 0.0;
@@ -128,14 +124,13 @@ int main(int argc, char* argv[])
         usage(argv[0]);
     }
 
-    // Set number of threads for OpenMP.
     omp_set_num_threads(nthreads);
 
     std::cout << "Running LU Decomposition with row pivoting on a "
               << n << " x " << n 
               << " matrix using " << nthreads << " threads.\n";
 
-    // 1) Generate random matrix (keep copy for residual check).
+    // 1) Generate random matrix (and keep a copy for residual check).
     double *A0 = generate_random_matrix(n, nthreads);
 
     // 2) Copy A0 to A for factorization.
@@ -153,7 +148,6 @@ int main(int argc, char* argv[])
         std::cerr << "ERROR: failed to allocate L or U.\n";
         exit(EXIT_FAILURE);
     }
-    // Initialize L’s diagonal to 1.0.
     for (int i = 0; i < n; i++) {
         L[(long)i * n + i] = 1.0;
     }
@@ -168,13 +162,16 @@ int main(int argc, char* argv[])
         piv[i] = i;
     }
 
-    // Allocate temporary reduction arrays for pivot search.
+    // Allocate temporary arrays for pivot reduction.
     double *thread_maxvals = new double[nthreads];
     int    *thread_maxrows = new int[nthreads];
 
-    // 5) Perform LU factorization with row pivoting.
-    bool singular = false;  // shared flag to detect singular matrix.
+    // 5) LU factorization with row pivoting.
+    bool singular = false;  // flag for singular matrix.
     double t_start = omp_get_wtime();
+
+    // Block size for the trailing submatrix update.
+    const int block_size = 64;
 
     #pragma omp parallel default(none) shared(A, L, U, piv, n, singular, thread_maxvals, thread_maxrows)
     {
@@ -189,7 +186,7 @@ int main(int argc, char* argv[])
             double local_maxval = 0.0;
             int local_maxrow = k;
 
-            // Each thread searches its assigned chunk of rows in column k.
+            // Each thread searches a chunk of rows in column k.
             #pragma omp for nowait
             for (int i = k; i < n; i++) {
                 double val = std::fabs(elem(A, n, i, k));
@@ -217,7 +214,7 @@ int main(int argc, char* argv[])
                     }
                 }
                 if (maxval == 0.0) {
-                    singular = true; // pivot is zero -> singular matrix.
+                    singular = true;
                 } else {
                     int tmpP = piv[k];
                     piv[k] = piv[maxrow];
@@ -248,14 +245,18 @@ int main(int argc, char* argv[])
                     L[i * n + k] = A[i * n + k] / pivotVal;
                     U[k * n + i] = A[k * n + i];
                 }
+                // Trailing submatrix update with blocking.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     double lik = L[i * n + k];
-                    double* __restrict__ Arow = &A[i * n];
-                    double* __restrict__ Urow = &U[k * n];
-                    #pragma omp simd
-                    for (int j = k+1; j < n; j++) {
-                        Arow[j] -= lik * Urow[j];
+                    for (int jb = k+1; jb < n; jb += block_size) {
+                        int jend = std::min(n, jb + block_size);
+                        double* __restrict__ Arow = &A[i * n];
+                        double* __restrict__ Urow = &U[k * n];
+                        #pragma omp simd
+                        for (int j = jb; j < jend; j++) {
+                            Arow[j] -= lik * Urow[j];
+                        }
                     }
                 }
             }
