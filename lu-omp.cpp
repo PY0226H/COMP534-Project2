@@ -1,15 +1,12 @@
 /*************************************************************
  * lu-omp.cpp
  *
- * Optimized OpenMP-based LU Decomposition with Partial Pivoting.
+ * Further Optimized OpenMP-based LU Decomposition with Partial Pivoting.
  * - Uses drand48_r() for thread-safe random number generation.
- * - Single parallel region for improved performance (avoids
- *   repeated creation/teardown of parallel teams).
- * - Uses pointer arithmetic and the restrict qualifier to help
- *   the compiler with aliasing.
- * - Introduces blocking (tiling) in the trailing submatrix update
- *   to improve cache locality and overall performance.
- * - Conforms with the project requirements.
+ * - Single parallel region to avoid team creation overhead.
+ * - Uses blocking (tiling) in the trailing submatrix update to improve cache locality.
+ * - Uses pointer arithmetic and restrict qualifiers to assist vectorization.
+ * - Conforms to the project requirements.
  *************************************************************/
 
 #include <cstdio>
@@ -38,16 +35,15 @@ inline double& elem(double *matrix, int n, int i, int j) {
 
 /*
   Generates an n x n matrix of random doubles in [0,1) using drand48_r().
-  Each thread has its own seed/state, which avoids data races.
+  Each thread has its own seed/state to avoid data races.
 */
 double* generate_random_matrix(int n, int nthreads) {
-    // NUMA local allocation
+    // NUMA local allocation.
     double *mat = (double*) numa_alloc_local((size_t)n * n * sizeof(double));
     if (!mat) {
         std::cerr << "ERROR: numa_alloc_local failed for matrix.\n";
         exit(EXIT_FAILURE);
     }
-
     #pragma omp parallel num_threads(nthreads)
     {
         struct drand48_data randBuf;
@@ -64,11 +60,10 @@ double* generate_random_matrix(int n, int nthreads) {
 
 /*
   Compute the L2,1 norm (sum of Euclidean norms of columns) of (P*A - L*U).
-
   Steps:
     1) Form PA by permuting rows of A according to piv.
     2) Compute R = PA - L*U.
-    3) Sum_{j=0..n-1} sqrt( sum_{i=0..n-1} R(i,j)^2 ).
+    3) Sum over columns: sum_{j=0}^{n-1} sqrt( sum_{i=0}^{n-1} (R(i,j))^2 ).
 */
 double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, double *U) {
     double *PA = (double*) calloc((size_t)n * n, sizeof(double));
@@ -80,7 +75,6 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
         int srcRow = piv[i];
         memcpy(&PA[(long)i * n], &Aorig[(long)srcRow * n], n * sizeof(double));
     }
-
     double *R = (double*) calloc((size_t)n * n, sizeof(double));
     if (!R) {
         std::cerr << "ERROR: could not allocate memory for R.\n";
@@ -95,7 +89,6 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
             R[(long)i * n + j] = PA[(long)i * n + j] - sumLU;
         }
     }
-
     double l21 = 0.0;
     for (int j = 0; j < n; j++) {
         double sumSq = 0.0;
@@ -105,7 +98,6 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
         }
         l21 += std::sqrt(sumSq);
     }
-
     free(PA);
     free(R);
     return l21;
@@ -123,12 +115,10 @@ int main(int argc, char* argv[])
     if (n <= 0 || nthreads <= 0) {
         usage(argv[0]);
     }
-
     omp_set_num_threads(nthreads);
-
-    std::cout << "Running LU Decomposition with row pivoting on a "
-              << n << " x " << n 
-              << " matrix using " << nthreads << " threads.\n";
+    std::cout << "Running LU Decomposition with row pivoting on a " 
+              << n << " x " << n << " matrix using " 
+              << nthreads << " threads.\n";
 
     // 1) Generate random matrix (and keep a copy for residual check).
     double *A0 = generate_random_matrix(n, nthreads);
@@ -141,7 +131,7 @@ int main(int argc, char* argv[])
     }
     memcpy(A, A0, (size_t)n * n * sizeof(double));
 
-    // 3) Allocate L, U.
+    // 3) Allocate L and U.
     double * __restrict__ L = (double* __restrict__) calloc((size_t)n * n, sizeof(double));
     double * __restrict__ U = (double* __restrict__) calloc((size_t)n * n, sizeof(double));
     if (!L || !U) {
@@ -167,11 +157,12 @@ int main(int argc, char* argv[])
     int    *thread_maxrows = new int[nthreads];
 
     // 5) LU factorization with row pivoting.
-    bool singular = false;  // flag for singular matrix.
+    bool singular = false;  // flag to detect singular matrix.
     double t_start = omp_get_wtime();
 
-    // Block size for the trailing submatrix update.
-    const int block_size = 64;
+    // Block sizes for the trailing submatrix update.
+    const int block_size_i = 64;
+    const int block_size_j = 64;
 
     #pragma omp parallel default(none) shared(A, L, U, piv, n, singular, thread_maxvals, thread_maxrows)
     {
@@ -181,12 +172,9 @@ int main(int argc, char* argv[])
                 #pragma omp barrier
                 continue;
             }
-
             int tid = omp_get_thread_num();
             double local_maxval = 0.0;
             int local_maxrow = k;
-
-            // Each thread searches a chunk of rows in column k.
             #pragma omp for nowait
             for (int i = k; i < n; i++) {
                 double val = std::fabs(elem(A, n, i, k));
@@ -197,9 +185,7 @@ int main(int argc, char* argv[])
             }
             thread_maxvals[tid] = local_maxval;
             thread_maxrows[tid] = local_maxrow;
-
             #pragma omp barrier
-
             double maxval;
             int maxrow;
             #pragma omp single
@@ -216,16 +202,18 @@ int main(int argc, char* argv[])
                 if (maxval == 0.0) {
                     singular = true;
                 } else {
+                    // Swap pivot entries.
                     int tmpP = piv[k];
                     piv[k] = piv[maxrow];
                     piv[maxrow] = tmpP;
-
+                    // Swap rows in A.
                     if (maxrow != k) {
                         for (int j = 0; j < n; j++) {
                             double tmpA = A[k * n + j];
                             A[k * n + j] = A[maxrow * n + j];
                             A[maxrow * n + j] = tmpA;
                         }
+                        // Swap the first k entries of L.
                         for (int j = 0; j < k; j++) {
                             double tmpL = L[k * n + j];
                             L[k * n + j] = L[maxrow * n + j];
@@ -236,7 +224,6 @@ int main(int argc, char* argv[])
                 }
             }
             #pragma omp barrier
-
             if (!singular)
             {
                 double pivotVal = A[k * n + k];
@@ -245,17 +232,19 @@ int main(int argc, char* argv[])
                     L[i * n + k] = A[i * n + k] / pivotVal;
                     U[k * n + i] = A[k * n + i];
                 }
-                // Trailing submatrix update with blocking.
-                #pragma omp for
-                for (int i = k+1; i < n; i++) {
-                    double lik = L[i * n + k];
-                    for (int jb = k+1; jb < n; jb += block_size) {
-                        int jend = std::min(n, jb + block_size);
-                        double* __restrict__ Arow = &A[i * n];
-                        double* __restrict__ Urow = &U[k * n];
-                        #pragma omp simd
-                        for (int j = jb; j < jend; j++) {
-                            Arow[j] -= lik * Urow[j];
+                // Trailing submatrix update: use two-level blocking.
+                #pragma omp for schedule(static)
+                for (int ii = k+1; ii < n; ii += block_size_i) {
+                    int iend = std::min(n, ii + block_size_i);
+                    for (int jj = k+1; jj < n; jj += block_size_j) {
+                        int jend = std::min(n, jj + block_size_j);
+                        for (int i = ii; i < iend; i++) {
+                            double lik = L[i * n + k];
+                            double* __restrict__ Arow = &A[i * n];
+                            double* __restrict__ Urow = &U[k * n];
+                            for (int j = jj; j < jend; j++) {
+                                Arow[j] -= lik * Urow[j];
+                            }
                         }
                     }
                 }
