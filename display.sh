@@ -1,0 +1,2 @@
+export OMP_DISPLAY_ENV=VERBOSE
+export KMP_AFFINITY=verbose
