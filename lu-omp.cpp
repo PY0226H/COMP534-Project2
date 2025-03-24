@@ -214,4 +214,96 @@ bool blocked_lu_factor(double *A, double *L, double *U, int *piv,
             for (int j = k+kb; j < n; j++) {
                 double sumVal = 0.0;
                 for (int x = k; x < k+kb; x++) {
-                    sumVal += elem(L, n, i, x) * elem*
+                    sumVal += elem(L, n, i, x) * elem(U, n, x, j);
+                }
+                elem(A, n, i, j) -= sumVal;
+            }
+        }
+    }
+    return true;
+}
+
+//---------------------------------------------------------------------
+// Main
+//---------------------------------------------------------------------
+int main(int argc, char* argv[])
+{
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <matrix_size> <num_threads>\n";
+        return 1;
+    }
+    int n = std::atoi(argv[1]);
+    int nthreads = std::atoi(argv[2]);
+
+    if (n <= 0 || nthreads <= 0) {
+        std::cerr << "Error: invalid n or nthreads.\n";
+        return 1;
+    }
+
+    omp_set_num_threads(nthreads);
+
+    std::cout << "Blocked LU Factorization (partial pivot) on " 
+              << n << " x " << n 
+              << " matrix with " << nthreads << " threads.\n";
+
+    // 1) Generate random matrix
+    double *A0 = generate_random_matrix(n, nthreads);
+
+    // 2) Allocate A, L, U
+    double *A = (double*) numa_alloc_local((size_t)n * n * sizeof(double));
+    double *L = (double*) calloc((size_t)n * n, sizeof(double));
+    double *U = (double*) calloc((size_t)n * n, sizeof(double));
+    if (!A || !L || !U) {
+        std::cerr << "Error: allocation failed.\n";
+        return 1;
+    }
+    std::memcpy(A, A0, (size_t)n*n*sizeof(double));
+
+    // Initialize L’s diagonal
+    for (int i = 0; i < n; i++) {
+        elem(L, n, i, i) = 1.0;
+    }
+
+    // 3) Allocate pivot array
+    int *piv = (int*) malloc(n * sizeof(int));
+    if (!piv) {
+        std::cerr << "Error: pivot allocation failed.\n";
+        return 1;
+    }
+    for (int i = 0; i < n; i++) {
+        piv[i] = i;
+    }
+
+    // 4) Perform blocked LU factorization
+    //    Tune block_size for your architecture
+    const int block_size = 64;
+
+    double t1 = omp_get_wtime();
+    bool ok = blocked_lu_factor(A, L, U, piv, n, block_size);
+    double t2 = omp_get_wtime();
+
+    if (!ok) {
+        std::cerr << "ERROR: matrix is singular (pivot=0)\n";
+    }
+
+    // 5) Compute residual
+    double l21_norm = 0.0;
+    if (ok) {
+        l21_norm = compute_residual_l21_norm(A0, n, piv, L, U);
+    }
+
+    // 6) Print results
+    std::cout << "LU factorization time: " << (t2 - t1) << " seconds.\n";
+    if (ok) {
+        std::cout << "Residual L2,1 norm = " << l21_norm << "\n";
+    }
+
+    // 7) Cleanup
+    numa_free(A0, (size_t)n*n*sizeof(double));
+    numa_free(A,  (size_t)n*n*sizeof(double));
+    free(L);
+    free(U);
+    free(piv);
+
+    return 0;
+}
