@@ -156,7 +156,7 @@ int main(int argc, char* argv[])
         // Pivot search
         double maxval = 0.0;
         int maxrow = -1;
-
+        double local_max, local_row;
         #pragma omp parallel default(none) \
                      private(local_max, local_row) \
                      shared(A, n, k, maxval, maxrow)
