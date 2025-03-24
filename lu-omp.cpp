@@ -17,19 +17,29 @@ inline double& elem(double *matrix, int n, int i, int j) {
 }
 
 // Generate an n x n matrix of random doubles in [0,1).
-double* generate_random_matrix(int n) {
+double* generate_random_matrix(int n, int nthreads)
+{
+    // NUMA local allocation for big matrix
     double *mat = (double*) numa_alloc_local( (size_t)n * n * sizeof(double) );
     if (!mat) {
         std::cerr << "ERROR: numa_alloc_local failed for matrix.\n";
         exit(EXIT_FAILURE);
     }
 
-    // Seed can be changed or made thread-specific if generating in parallel
-    srand48(2023);
+    // Parallel initialization with per-thread random state
+    #pragma omp parallel num_threads(nthreads)
+    {
+        struct drand48_data randBuf;
+        // seed each thread's generator differently 
+        // (just an example: 2023 + threadID)
+        srand48_r(2023 + 37 * omp_get_thread_num(), &randBuf);
 
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n*n; i++) {
-        mat[i] = drand48(); 
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n*n; i++) {
+            double x;
+            drand48_r(&randBuf, &x);
+            mat[i] = x;
+        }
     }
 
     return mat;
