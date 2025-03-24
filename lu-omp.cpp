@@ -1,271 +1,272 @@
-/******************************************************************************
- * File:    lu_omp.cpp
- * Author:  (Your Name)
- *
- * Description:
- *   This program performs LU decomposition with partial (row) pivoting on an
- *   n x n matrix A in parallel using OpenMP.
- *   Usage:  ./lu_omp <n> <t>
- *   - n : matrix dimension
- *   - t : number of OpenMP threads
- *
- * Steps:
- *   1) Allocate and initialize A with random doubles in [0,1).
- *   2) Factor A into L and U using partial pivoting (keep track in permutation pi).
- *   3) Compute L2,1 norm of residual (P*A - L*U) to validate correctness.
- *   4) Print residual norm and timing for the factorization.
- *
- ******************************************************************************/
-
-#include <iostream>
-#include <iomanip>
-#include <cmath>
+#include <cstdio>
 #include <cstdlib>
-#include <vector>
-#include <omp.h>     // for OpenMP
-#include <random>    // for C++11 random generator
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <omp.h>
+#include <numa.h>
 
-/******************************************************************************
- * Function: initMatrix
- * --------------------
- * Initializes matrix A (size n x n) with uniform random numbers in [0, 1).
- * A is stored in row-major 1D array of length n*n.
- *****************************************************************************/
-void initMatrix(double* A, int n, unsigned int seed)
-{
-    // Create a Mersenne Twister pseudo-random generator for stable, repeatable results
-    // Each thread or each call can have a different seed to reduce correlation if needed.
-    std::mt19937 gen(seed);
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-
-    // Fill A row by row
-    for(int i = 0; i < n*n; i++) {
-        A[i] = dist(gen);
-    }
+static void usage(const char *progName) {
+    std::cerr << "Usage: " << progName << " <matrix_size> <num_threads>\n";
+    exit(EXIT_FAILURE);
 }
 
-/******************************************************************************
- * Function: computeResidualL21
- * ----------------------------
- * Computes the L2,1 norm of the residual (P*A - L*U).
- *
- * Inputs:
- *   A   : Original matrix (row-major)
- *   L   : Lower-triangular matrix from factorization (row-major)
- *   U   : Upper-triangular matrix from factorization (row-major)
- *   pi  : Permutation array of length n; pi[k] gives the row in A that was
- *         permuted to row k in the factorization.
- *   n   : dimension
- *
- * Return:
- *   double - the sum of Euclidean norms of each column of (P*A - L*U).
- *****************************************************************************/
-double computeResidualL21(const double* A,
-                          const double* L,
-                          const double* U,
-                          const std::vector<int>& pi,
-                          int n)
-{
-    double norm_sum = 0.0;
-
-    // For each column j, compute the Euclidean norm of column j of (P*A - L*U).
-    for(int j = 0; j < n; j++) {
-        double col_norm_sq = 0.0;
-        // Compute each entry i of column j in the residual
-        for(int i = 0; i < n; i++) {
-            // P*A row i is actually row pi[i] of A
-            double pa_ij = A[ pi[i]*n + j ];
-
-            // (L*U)(i,j) = sum_{k=0..n-1} L(i,k)*U(k,j)
-            // But effectively, L is lower-triangular and U is upper-triangular
-            // so many terms are zero. For correctness, we do the full sum.
-            double lu_val = 0.0;
-            for(int k = 0; k < n; k++) {
-                lu_val += L[i*n + k] * U[k*n + j];
-            }
-            double diff = pa_ij - lu_val;
-            col_norm_sq += diff * diff;
-        }
-        double col_norm = std::sqrt(col_norm_sq);
-        norm_sum += col_norm;
-    }
-
-    return norm_sum;
+/*
+  Utility function to return a reference to A(i,j) if stored in row-major
+  in a 1D array "A" of size n*n.
+*/
+inline double& A(double *matrix, int n, int i, int j) {
+    return matrix[(long)i * n + j];
 }
 
-/******************************************************************************
- * Function: lu_decomposition
- * --------------------------
- * Performs LU decomposition with partial (row) pivoting on matrix A in-place,
- * producing L and U, plus a permutation array pi representing P.
- *
- *   A (in/out): row-major array of size n*n. Overwritten during process.
- *   L        : row-major array for L (n*n)
- *   U        : row-major array for U (n*n)
- *   pi       : vector<int> of length n for pivot info
- *   n        : dimension
- *
- * The final factorization is: P*A = L*U.
- *
- * Steps:
- *   1) Initialize pi, L (identity on diagonal), U (0).
- *   2) For k = 0..n-1:
- *       a) Find pivot row (k') with max |A(i,k)|, i in [k..n-1].
- *       b) If max == 0 => singular matrix => error.
- *       c) Swap pi[k] and pi[k'], swap row k and k' in A, and row k and k' of L up to k-1.
- *       d) U(k,k) = A(k,k).
- *       e) For i>k: L(i,k) = A(i,k)/U(k,k), U(k,i) = A(k,i).
- *       f) Update trailing submatrix of A.
- *****************************************************************************/
-void lu_decomposition(double* A,
-                      double* L,
-                      double* U,
-                      std::vector<int>& pi,
-                      int n)
-{
-    // 1) Initialize pi, L, U
-    for(int i = 0; i < n; i++) {
-        pi[i] = i;
+/*
+  Generates an n x n matrix of random doubles in [0,1).
+  We allocate with numa_alloc_local. You can remove or adapt if needed.
+*/
+double* generate_random_matrix(int n) {
+    double *mat = (double*) numa_alloc_local( (size_t)n * n * sizeof(double) );
+    if (!mat) {
+        std::cerr << "ERROR: numa_alloc_local failed for matrix.\n";
+        exit(EXIT_FAILURE);
     }
 
-    #pragma omp parallel for
-    for(int i = 0; i < n; i++) {
-        for(int j = 0; j < n; j++) {
-            L[i*n + j] = (i == j) ? 1.0 : 0.0; // identity for L
-            U[i*n + j] = 0.0;                 // zero for U
+    // Initialize the random number generator. For repeatability,
+    // you might want a fixed seed. For truly random, seed with time.
+    srand48(2023);
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n*n; i++) {
+        mat[i] = drand48(); 
+    }
+
+    return mat;
+}
+
+/*
+  We will compute the residual's L2,1 norm: sum of Euclidian norms of each column of (P*A - L*U).
+
+  Steps to do this safely:
+  1. Form P*A into a temporary matrix PA (by reordering rows of the original A).
+  2. Compute R = PA - L*U.
+  3. For each column j, compute sqrt( sum_i (R(i,j))^2 ), and sum that over j.
+*/
+double compute_residual_l21_norm(
+    double *Aorig, int n, 
+    int *piv,     // pivot array (i.e., pi)
+    double *L, 
+    double *U
+) {
+    // 1. Compute PA into a temporary matrix
+    double *PA = (double*) calloc((size_t)n * n, sizeof(double));
+    if (!PA) {
+        std::cerr << "ERROR: could not allocate memory for PA.\n";
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n; i++) {
+        // row i of P*A is pivot[i]-th row of Aorig
+        int srcRow = piv[i];
+        memcpy(&PA[(long)i * n], &Aorig[(long)srcRow * n], n * sizeof(double));
+    }
+
+    // 2. Allocate R = PA - L*U
+    double *R = (double*) calloc((size_t)n * n, sizeof(double));
+    if (!R) {
+        std::cerr << "ERROR: could not allocate memory for R.\n";
+        exit(EXIT_FAILURE);
+    }
+
+    // R = PA - L*U
+    // We'll do: for each i,j
+    //    R(i,j) = PA(i,j) - sum_{k=0..n-1} L(i,k)*U(k,j)
+    // But L, U are both triangular. We can do a triple nested loop carefully.
+    // For correctness, let's do the straightforward approach.
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            double sumLU = 0.0;
+            for (int k = 0; k < n; k++) {
+                // If k>i, L(i,k)=0. If k<j, U(k,j)=0. But let's skip that optimization for clarity.
+                sumLU += L[(long)i*n + k] * U[(long)k*n + j];
+            }
+            R[(long)i*n + j] = PA[(long)i*n + j] - sumLU;
         }
     }
 
-    // 2) Main loop over columns k
-    for(int k = 0; k < n; k++) {
-        // a) Partial pivot search for row with max |A(i,k)|
-        double max_val = 0.0;
-        int kprime = k;
-
-        {
-            // Parallel region to find pivot
-            #pragma omp parallel
-            {
-                double local_max = 0.0;
-                int local_index = k;
-
-                #pragma omp for nowait
-                for(int i = k; i < n; i++){
-                    double val = std::fabs(A[i*n + k]);
-                    if(val > local_max) {
-                        local_max  = val;
-                        local_index = i;
-                    }
-                }
-                // Combine results
-                #pragma omp critical
-                {
-                    if(local_max > max_val) {
-                        max_val = local_max;
-                        kprime = local_index;
-                    }
-                }
-            }
+    // 3. Now compute the sum of Euclidian norms of columns of R
+    double l21 = 0.0;
+    for (int j = 0; j < n; j++) {
+        double sumSq = 0.0;
+        for (int i = 0; i < n; i++) {
+            double val = R[(long)i*n + j];
+            sumSq += val * val;
         }
+        l21 += std::sqrt(sumSq);
+    }
 
-        if(max_val == 0.0) {
-            std::cerr << "Error: singular matrix (zero pivot found)\n";
-            std::exit(EXIT_FAILURE);
-        }
+    free(PA);
+    free(R);
 
-        // b) Swap rows in pi, A, and L (up to column k-1)
-        if(kprime != k) {
-            // swap pi
-            int tmp_pi = pi[k];
-            pi[k] = pi[kprime];
-            pi[kprime] = tmp_pi;
-
-            // swap row k and row kprime in A
-            #pragma omp parallel for
-            for(int col = 0; col < n; col++) {
-                double tmp = A[k*n + col];
-                A[k*n + col] = A[kprime*n + col];
-                A[kprime*n + col] = tmp;
-            }
-
-            // swap L up to column k-1
-            #pragma omp parallel for
-            for(int col = 0; col < k; col++) {
-                double tmp = L[k*n + col];
-                L[k*n + col] = L[kprime*n + col];
-                L[kprime*n + col] = tmp;
-            }
-        }
-
-        // c) U(k,k) = A(k,k)
-        double pivotVal = A[k*n + k];
-        U[k*n + k] = pivotVal;
-
-        // d) Fill in L(i,k) and U(k,i) for i in [k+1..n-1]
-        #pragma omp parallel for
-        for(int i = k+1; i < n; i++) {
-            L[i*n + k] = A[i*n + k] / pivotVal; // below diagonal
-            U[k*n + i] = A[k*n + i];           // on/above diagonal
-        }
-
-        // e) Update trailing submatrix of A
-        //    A(i,j) -= L(i,k) * U(k,j), for i>k, j>k
-        #pragma omp parallel for
-        for(int i = k+1; i < n; i++){
-            for(int j = k+1; j < n; j++){
-                A[i*n + j] -= L[i*n + k] * U[k*n + j];
-            }
-        }
-    } // end for k
+    return l21;
 }
 
 int main(int argc, char* argv[])
 {
-    if(argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <matrix_size> <num_threads>\n";
-        return 1;
+    if (argc < 3) {
+        usage(argv[0]);
     }
 
-    int n = std::atoi(argv[1]);
-    int t = std::atoi(argv[2]);
+    int n = std::atoi(argv[1]);    // matrix size
+    int nthreads = std::atoi(argv[2]); // number of threads
 
-    // 1) Set number of OMP threads
-    omp_set_num_threads(t);
+    omp_set_num_threads(nthreads);
 
-    // 2) Allocate memory for A, L, U
-    //    We'll store them in row-major form as 1D arrays of length n*n.
-    double* A = new double[n * n];
-    double* L = new double[n * n];
-    double* U = new double[n * n];
+    std::cout << "Running LU Decomposition with row pivoting on a " 
+              << n << " x " << n 
+              << " matrix using " << nthreads << " threads.\n";
 
-    // 3) Initialize A with random values
-    initMatrix(A, n, /*seed=*/12345);
+    // 1. Generate random matrix A0, which we will keep for computing residual
+    double *A0 = generate_random_matrix(n);
 
-    // 4) Prepare permutation array pi
-    std::vector<int> pi(n);
+    // 2. Copy A0 into A for factorization, because we must not destroy the original
+    double *A = (double*) numa_alloc_local( (size_t)n * n * sizeof(double) );
+    if (!A) {
+        std::cerr << "ERROR: numa_alloc_local failed for A.\n";
+        exit(EXIT_FAILURE);
+    }
 
-    // 5) Time the LU decomposition
-    double start_time = omp_get_wtime();
-    lu_decomposition(A, L, U, pi, n);
-    double end_time = omp_get_wtime();
+    memcpy(A, A0, (size_t)n * n * sizeof(double));
 
-    double factor_time = end_time - start_time;
+    // 3. Allocate L and U (each n x n). 
+    //    We'll store them fully as n*n, but only use lower-triangle or upper-triangle as needed.
+    double *L = (double*) calloc((size_t)n * n, sizeof(double));
+    double *U = (double*) calloc((size_t)n * n, sizeof(double));
+    if (!L || !U) {
+        std::cerr << "ERROR: failed to allocate L or U.\n";
+        exit(EXIT_FAILURE);
+    }
+    // Initialize L’s diagonal to 1.0
+    for (int i = 0; i < n; i++) {
+        L[(long)i * n + i] = 1.0;
+    }
 
-    // 6) Compute L2,1 norm of residual (P*A - L*U)
-    //    This step is for correctness verification. Typically done in serial.
-    double residual_norm = computeResidualL21(A, L, U, pi, n);
+    // 4. Allocate the pivot array pi, which will track row permutations
+    //    We'll store the row index that ends up in the i-th row after pivoting.
+    int *piv = (int*) malloc(n * sizeof(int));
+    if (!piv) {
+        std::cerr << "ERROR: failed to allocate pivot array.\n";
+        exit(EXIT_FAILURE);
+    }
+    // Initialize pi[i] = i
+    for (int i = 0; i < n; i++) {
+        piv[i] = i;
+    }
 
-    // 7) Print results
-    std::cout << std::fixed << std::setprecision(6);
-    std::cout << "Matrix size (n): " << n << "\n";
-    std::cout << "Number of threads: " << t << "\n";
-    std::cout << "LU Decomposition Time (sec): " << factor_time << "\n";
-    std::cout << "Residual L2,1 Norm: " << residual_norm << "\n";
+    // 5. Perform the row-pivoted LU factorization using the pseudocode structure
+    double t_start = omp_get_wtime();
 
-    // 8) Cleanup
-    delete[] A;
-    delete[] L;
-    delete[] U;
+    for (int k = 0; k < n; k++) {
+        // Pivot search: find row r >= k that has the largest absolute A(r, k)
+        double maxval = 0.0;
+        int maxrow = -1;
+
+        // We can parallelize the pivot search
+        #pragma omp parallel
+        {
+            double local_max = 0.0;
+            int local_row = -1;
+
+            #pragma omp for nowait
+            for (int i = k; i < n; i++) {
+                double val = std::fabs(A(A, n, i, k));
+                if (val > local_max) {
+                    local_max = val;
+                    local_row = i;
+                }
+            }
+            // Reduce the local maxima
+            #pragma omp critical
+            {
+                if (local_max > maxval) {
+                    maxval = local_max;
+                    maxrow = local_row;
+                }
+            }
+        }
+
+        if (maxval == 0.0) {
+            std::cerr << "ERROR: Factorization failed: matrix is singular or nearly singular.\n";
+            exit(EXIT_FAILURE);
+        }
+
+        // 6. Swap pivot array entries piv[k] and piv[maxrow]
+        {
+            int tmp = piv[k];
+            piv[k] = piv[maxrow];
+            piv[maxrow] = tmp;
+        }
+
+        // 7. Swap entire row k and row maxrow of A 
+        if (maxrow != k) {
+            #pragma omp parallel for schedule(static)
+            for (int j = 0; j < n; j++) {
+                double tmp = A(A, n, k, j);
+                A(A, n, k, j) = A(A, n, maxrow, j);
+                A(A, n, maxrow, j) = tmp;
+            }
+            // Also swap L’s partial row (k, 0..k-1) with (maxrow, 0..k-1)
+            // but L is stored separately. We only swap columns < k in L 
+            // because columns >= k haven’t been set yet.
+            #pragma omp parallel for schedule(static)
+            for (int j = 0; j < k; j++) {
+                double tmp = L[(long)k*n + j];
+                L[(long)k*n + j] = L[(long)maxrow*n + j];
+                L[(long)maxrow*n + j] = tmp;
+            }
+        }
+
+        // 8. Set U(k,k) = A(k,k)
+        double pivotVal = A(A, n, k, k);
+        U[(long)k*n + k] = pivotVal;
+
+        // 9. For i = k+1..n-1:
+        //       L(i,k) = A(i,k)/U(k,k)
+        //       U(k,i) = A(k,i)
+        #pragma omp parallel for schedule(static)
+        for (int i = k+1; i < n; i++) {
+            L[(long)i*n + k] = A(A, n, i, k) / pivotVal;
+            U[(long)k*n + i] = A(A, n, k, i);
+        }
+
+        // 10. For i = k+1..n-1:
+        //        For j = k+1..n-1:
+        //           A(i,j) -= L(i,k) * U(k,j)
+        #pragma omp parallel for schedule(static)
+        for (int i = k+1; i < n; i++) {
+            double lik = L[(long)i*n + k];
+            for (int j = k+1; j < n; j++) {
+                A(A, n, i, j) -= lik * U[(long)k*n + j];
+            }
+        }
+    }
+
+    double t_end = omp_get_wtime();
+    double factor_time = t_end - t_start;
+
+    // 11. Now we have L and U. Let's check the residual. 
+    //     Because we destroyed A while factoring, we use the original A0
+    //     but re-order rows according to piv[] to compute (P*A0 - L*U).
+
+    double l21_norm = compute_residual_l21_norm(A0, n, piv, L, U);
+
+    // 12. Print results
+    std::cout << "LU factorization time: " << factor_time << " seconds.\n";
+    std::cout << "Residual L2,1 norm = " << l21_norm << "\n";
+
+    // Cleanup
+    numa_free(A0, (size_t)n * n * sizeof(double));
+    numa_free(A,  (size_t)n * n * sizeof(double));
+    free(L);
+    free(U);
+    free(piv);
 
     return 0;
 }
