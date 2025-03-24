@@ -1,53 +1,68 @@
-NOWARN=-wd3180
-EXEC=lu-omp
-OBJ =  $(EXEC) $(EXEC)-debug $(EXEC)-serial
+# Compiler and flags
+CXX = icpc
+CXXFLAGS = -O2 -fopenmp -std=c++11 -lrt -lnuma
+DEBUGFLAGS = -O0 -g -fopenmp -std=c++11 -lrt -lnuma
+NOWARN = -wd3180
 
-MATRIX_SIZE=8000
-MATRIX_CHECK_SIZE=100
-W :=`grep processor /proc/cpuinfo | wc -l`
+# Executables
+EXEC = lu-omp
+EXEC_DEBUG = $(EXEC)-debug
+EXEC_SERIAL = $(EXEC)-serial
 
-CHECKER=inspxe-cl -collect=ti3 -r check
-VIEWER=inspxe-gui
+# Problem sizes (override when calling make)
+MATRIX_SIZE = 8000
+CHECK_SIZE = 100
+W := $(shell grep processor /proc/cpuinfo | wc -l)
 
-# flags
-OPT=-O2 -g
-DEBUG=-O0 -g
-OMP=-fopenmp
+# Intel Inspector tools (for race detection)
+CHECKER = inspxe-cl -collect=ti3 -r check
+VIEWER = inspxe-gui
 
-all: $(OBJ)
+# Targets to build everything
+all: $(EXEC) $(EXEC_DEBUG) $(EXEC_SERIAL)
 
-# build the debug parallel version of the program
-$(EXEC)-debug: $(EXEC).cpp
-	icpc $(DEBUG) $(OMP) -o $(EXEC)-debug $(EXEC).cpp -lrt -lnuma
-
-
-# build the serial version of the program
-$(EXEC)-serial: $(EXEC).cpp
-	icpc $(OPT) $(NOWARN) -o $(EXEC)-serial $(EXEC).cpp -lrt -liomp5 -lnuma 
-
-# build the optimized parallel version of the program
+# Parallel optimized build
 $(EXEC): $(EXEC).cpp
-	icpc $(OPT) $(OMP) -o $(EXEC) $(EXEC).cpp -lrt -lnuma
+	$(CXX) $(CXXFLAGS) -o $(EXEC) $(EXEC).cpp
 
-#run the optimized program in parallel
+# Parallel debug build
+$(EXEC_DEBUG): $(EXEC).cpp
+	$(CXX) $(DEBUGFLAGS) -o $(EXEC_DEBUG) $(EXEC).cpp
+
+# Serial build (optional: same code with 1 thread)
+$(EXEC_SERIAL): $(EXEC).cpp
+	$(CXX) $(CXXFLAGS) $(NOWARN) -o $(EXEC_SERIAL) $(EXEC).cpp
+
+# Run parallel executable with number of workers (W)
 runp: $(EXEC)
-	@echo use make runp W=nworkers
+	@echo "Running parallel version with $(W) workers..."
 	./$(EXEC) $(MATRIX_SIZE) $(W)
 
-#run the serial version of your program
-runs: $(EXEC)-serial
-	@echo use make runs
-	./$(EXEC)-serial $(MATRIX_SIZE) 1
+# Run serial executable (always uses 1 thread)
+runs: $(EXEC_SERIAL)
+	@echo "Running serial version..."
+	./$(EXEC_SERIAL) $(MATRIX_SIZE) 1
 
-#run the optimized program with thread checker
+# Run parallel program with Intel Inspector thread checker
 check: $(EXEC)
-	@echo use make check W=nworkers
-	$(CHECKER) ./$(EXEC) $(MATRIX_SIZE) $(W)
+	@echo "Running Inspector to check for data races..."
+	$(CHECKER) ./$(EXEC) $(CHECK_SIZE) $(W)
 
-#view the thread checker result
+# View Inspector race detection results
 view:
+	@echo "Launching Inspector GUI..."
 	$(VIEWER) check*/check*.inspxe
 
-
+# Clean up builds and Inspector reports
 clean:
-	/bin/rm -rf $(OBJ) check*
+	rm -rf $(EXEC) $(EXEC_DEBUG) $(EXEC_SERIAL) check*
+
+# Convenience info
+info:
+	@echo "Executables:"
+	@echo "  make runp  # Run parallel version"
+	@echo "  make runs  # Run serial version"
+	@echo "  make check # Run parallel version with Intel Inspector"
+	@echo ""
+	@echo "Matrix Size: $(MATRIX_SIZE)"
+	@echo "Threads (W): $(W)"
