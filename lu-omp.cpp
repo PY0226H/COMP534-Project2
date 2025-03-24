@@ -5,10 +5,10 @@
  * - Uses drand48_r() for thread-safe random number generation.
  * - Single parallel region for improved performance (avoids
  *   repeated creation/teardown of parallel teams).
- * - Improved pivot search: each thread computes a local maximum
- *   for the current column, and a single thread reduces these
- *   results to choose the global pivot.
- * - Avoids data races that were detected by Intel Inspector.
+ * - Each thread computes its local maximum for the pivot search,
+ *   and the reduction is performed by a single thread.
+ * - Temporary reduction arrays are allocated outside the parallel
+ *   region to avoid cross-thread stack accesses.
  *************************************************************/
 
 #include <cstdio>
@@ -170,38 +170,30 @@ int main(int argc, char* argv[])
         piv[i] = i;
     }
 
+    // Allocate temporary reduction arrays for pivot search.
+    // These arrays are sized to the number of threads and shared by all threads.
+    double *thread_maxvals = new double[nthreads];
+    int    *thread_maxrows = new int[nthreads];
+
     // 5) Perform LU factorization with row pivoting
     bool singular = false;  // shared flag to detect singular matrix
     double t_start = omp_get_wtime();
 
-    // Parallel region: all threads execute the LU factorization in lock-step.
-    #pragma omp parallel default(none) shared(A, L, U, piv, n, singular)
+    #pragma omp parallel default(none) shared(A, L, U, piv, n, singular, thread_maxvals, thread_maxrows)
     {
-        // Allocate thread-local arrays (one per thread) to store pivot search results.
-        int num_threads = omp_get_num_threads();
-        double *thread_maxvals = nullptr;
-        int *thread_maxrows = nullptr;
-        #pragma omp single
-        {
-            thread_maxvals = new double[num_threads];
-            thread_maxrows = new int[num_threads];
-        }
-        #pragma omp barrier  // ensure allocation is complete
-
         for (int k = 0; k < n; k++)
         {
-            // Check for singular matrix; if found, all threads skip further work.
+            // If matrix is singular, synchronize and skip further work.
             if (singular) {
                 #pragma omp barrier
                 continue;
             }
 
-            // Each thread prepares its local variables for pivot search.
             int tid = omp_get_thread_num();
             double local_maxval = 0.0;
             int local_maxrow = k;
 
-            // Each thread searches its assigned chunk of the column for the largest absolute value.
+            // Each thread searches its assigned chunk of rows in column k.
             #pragma omp for nowait
             for (int i = k; i < n; i++) {
                 double val = std::fabs(elem(A, n, i, k));
@@ -210,19 +202,20 @@ int main(int argc, char* argv[])
                     local_maxrow = i;
                 }
             }
-            // Store the thread's local result.
+            // Write each thread’s local result to the shared arrays.
             thread_maxvals[tid] = local_maxval;
             thread_maxrows[tid] = local_maxrow;
 
-            #pragma omp barrier  // ensure all threads have written their results
+            #pragma omp barrier  // Ensure all threads have written their results
 
-            // One thread reduces the per-thread results to determine the global pivot.
+            // One thread performs the reduction.
             double maxval;
             int maxrow;
             #pragma omp single
             {
                 maxval = 0.0;
                 maxrow = k;
+                int num_threads = omp_get_num_threads();
                 for (int t = 0; t < num_threads; t++) {
                     if (thread_maxvals[t] > maxval) {
                         maxval = thread_maxvals[t];
@@ -230,7 +223,7 @@ int main(int argc, char* argv[])
                     }
                 }
                 if (maxval == 0.0) {
-                    singular = true; // set the flag if the pivot is zero
+                    singular = true; // pivot is zero -> singular matrix
                 } else {
                     // Swap pivot array entries.
                     int tmpP = piv[k];
@@ -255,13 +248,13 @@ int main(int argc, char* argv[])
                     U[(long)k*n + k] = elem(A, n, k, k);
                 }
             }
-            #pragma omp barrier  // ensure pivot decision is visible
+            #pragma omp barrier  // Ensure pivot decision is visible
 
-            // If singular, skip further updating.
+            // If singular, skip further updates.
             if (!singular)
             {
                 double pivotVal = elem(A, n, k, k);
-                // Update L(i,k) and U(k,i) for i = k+1..n-1.
+                // Update L(i,k) and U(k,i) for rows i = k+1..n-1.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     L[(long)i*n + k] = elem(A, n, i, k) / pivotVal;
@@ -272,23 +265,20 @@ int main(int argc, char* argv[])
                 for (int i = k+1; i < n; i++) {
                     double lik = L[(long)i*n + k];
                     for (int j = k+1; j < n; j++) {
-                        elem(A,n,i,j) -= lik * U[(long)k*n + j];
+                        elem(A, n, i, j) -= lik * U[(long)k*n + j];
                     }
                 }
             }
-            #pragma omp barrier  // synchronize at the end of iteration k
+            #pragma omp barrier  // Synchronize at end of iteration k
         } // end for k
-
-        // Free the thread-local arrays.
-        #pragma omp single
-        {
-            delete[] thread_maxvals;
-            delete[] thread_maxrows;
-        }
     } // end parallel region
 
     double t_end = omp_get_wtime();
     double factor_time = t_end - t_start;
+
+    // Free the temporary reduction arrays.
+    delete[] thread_maxvals;
+    delete[] thread_maxrows;
 
     // If singular, print error.
     if (singular) {
