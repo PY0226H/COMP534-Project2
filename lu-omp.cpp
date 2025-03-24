@@ -2,11 +2,12 @@
  * lu-omp.cpp
  *
  * Further Optimized OpenMP-based LU Decomposition with Partial Pivoting.
+ * Improvements:
  * - Uses drand48_r() for thread-safe random number generation.
- * - Single parallel region to avoid team creation overhead.
- * - Uses blocking (tiling) in the trailing submatrix update to improve cache locality.
- * - Uses pointer arithmetic and restrict qualifiers to assist vectorization.
- * - Conforms to the project requirements.
+ * - Uses a single parallel region with careful synchronization.
+ * - Applies blocking (tiling) in the trailing submatrix update for better cache locality.
+ * - Uses collapse(2) and simd directives to improve vectorization and load balance.
+ * - Allocates all large matrices (A, L, U) using NUMA-aware allocation.
  *************************************************************/
 
 #include <cstdio>
@@ -18,27 +19,20 @@
 #include <omp.h>
 #include <numa.h>
 
-/*
-  Print usage message.
-*/
+// Print usage message.
 static void usage(const char *progName) {
     std::cerr << "Usage: " << progName << " <matrix_size> <num_threads>\n";
     exit(EXIT_FAILURE);
 }
 
-/*
-  Utility for indexing a matrix stored in row-major layout as a 1D array.
-*/
+// Utility for indexing a matrix stored in row-major layout as a 1D array.
 inline double& elem(double *matrix, int n, int i, int j) {
     return matrix[(long)i * n + j];
 }
 
-/*
-  Generates an n x n matrix of random doubles in [0,1) using drand48_r().
-  Each thread has its own seed/state to avoid data races.
-*/
+// Generates an n x n matrix of random doubles in [0,1) using drand48_r().
+// Each thread has its own seed/state to avoid data races.
 double* generate_random_matrix(int n, int nthreads) {
-    // NUMA local allocation.
     double *mat = (double*) numa_alloc_local((size_t)n * n * sizeof(double));
     if (!mat) {
         std::cerr << "ERROR: numa_alloc_local failed for matrix.\n";
@@ -58,13 +52,11 @@ double* generate_random_matrix(int n, int nthreads) {
     return mat;
 }
 
-/*
-  Compute the L2,1 norm (sum of Euclidean norms of columns) of (P*A - L*U).
-  Steps:
-    1) Form PA by permuting rows of A according to piv.
-    2) Compute R = PA - L*U.
-    3) Sum over columns: sum_{j=0}^{n-1} sqrt( sum_{i=0}^{n-1} (R(i,j))^2 ).
-*/
+// Compute the L2,1 norm (sum of Euclidean norms of columns) of (P*A - L*U).
+// Steps:
+//   1) Form PA by permuting rows of A according to piv.
+//   2) Compute R = PA - L*U.
+//   3) Sum over columns: sum_{j=0}^{n-1} sqrt( sum_{i=0}^{n-1} (R(i,j))^2 ).
 double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, double *U) {
     double *PA = (double*) calloc((size_t)n * n, sizeof(double));
     if (!PA) {
@@ -103,7 +95,6 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
     return l21;
 }
 
-
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
@@ -131,13 +122,16 @@ int main(int argc, char* argv[])
     }
     memcpy(A, A0, (size_t)n * n * sizeof(double));
 
-    // 3) Allocate L and U.
-    double * __restrict__ L = (double* __restrict__) calloc((size_t)n * n, sizeof(double));
-    double * __restrict__ U = (double* __restrict__) calloc((size_t)n * n, sizeof(double));
+    // 3) Allocate L and U using NUMA local allocation.
+    double * __restrict__ L = (double* __restrict__) numa_alloc_local((size_t)n * n * sizeof(double));
+    double * __restrict__ U = (double* __restrict__) numa_alloc_local((size_t)n * n * sizeof(double));
     if (!L || !U) {
         std::cerr << "ERROR: failed to allocate L or U.\n";
         exit(EXIT_FAILURE);
     }
+    // Initialize L to 0 and U to 0, then set L's diagonal to 1.
+    memset(L, 0, n * n * sizeof(double));
+    memset(U, 0, n * n * sizeof(double));
     for (int i = 0; i < n; i++) {
         L[(long)i * n + i] = 1.0;
     }
@@ -152,7 +146,7 @@ int main(int argc, char* argv[])
         piv[i] = i;
     }
 
-    // Allocate temporary arrays for pivot reduction.
+    // Allocate temporary arrays for per-thread pivot reduction.
     double *thread_maxvals = new double[nthreads];
     int    *thread_maxrows = new int[nthreads];
 
@@ -164,10 +158,9 @@ int main(int argc, char* argv[])
     const int block_size_i = 64;
     const int block_size_j = 64;
 
-    #pragma omp parallel default(none) shared(A, L, U, piv, n, singular, thread_maxvals, thread_maxrows)
+    #pragma omp parallel default(none) shared(A, L, U, piv, n, singular, thread_maxvals, thread_maxrows, block_size_i, block_size_j)
     {
-        for (int k = 0; k < n; k++)
-        {
+        for (int k = 0; k < n; k++) {
             if (singular) {
                 #pragma omp barrier
                 continue;
@@ -175,6 +168,7 @@ int main(int argc, char* argv[])
             int tid = omp_get_thread_num();
             double local_maxval = 0.0;
             int local_maxrow = k;
+            // Parallel pivot search over rows k...n-1.
             #pragma omp for nowait
             for (int i = k; i < n; i++) {
                 double val = std::fabs(elem(A, n, i, k));
@@ -186,6 +180,7 @@ int main(int argc, char* argv[])
             thread_maxvals[tid] = local_maxval;
             thread_maxrows[tid] = local_maxrow;
             #pragma omp barrier
+
             double maxval;
             int maxrow;
             #pragma omp single
@@ -224,24 +219,27 @@ int main(int argc, char* argv[])
                 }
             }
             #pragma omp barrier
-            if (!singular)
-            {
+
+            if (!singular) {
                 double pivotVal = A[k * n + k];
+                // Update L and U for the kth column/row.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     L[i * n + k] = A[i * n + k] / pivotVal;
                     U[k * n + i] = A[k * n + i];
                 }
-                // Trailing submatrix update: use two-level blocking.
-                #pragma omp for schedule(static)
+                // Trailing submatrix update: update A(i,j) for i,j > k.
+                // Using collapse(2) to combine the two outer loops and simd for the inner loop.
+                #pragma omp for collapse(2) schedule(static)
                 for (int ii = k+1; ii < n; ii += block_size_i) {
-                    int iend = std::min(n, ii + block_size_i);
                     for (int jj = k+1; jj < n; jj += block_size_j) {
+                        int iend = std::min(n, ii + block_size_i);
                         int jend = std::min(n, jj + block_size_j);
                         for (int i = ii; i < iend; i++) {
                             double lik = L[i * n + k];
                             double* __restrict__ Arow = &A[i * n];
                             double* __restrict__ Urow = &U[k * n];
+                            #pragma omp simd
                             for (int j = jj; j < jend; j++) {
                                 Arow[j] -= lik * Urow[j];
                             }
@@ -275,8 +273,8 @@ int main(int argc, char* argv[])
 
     numa_free(A0, (size_t)n * n * sizeof(double));
     numa_free(A, (size_t)n * n * sizeof(double));
-    free(L);
-    free(U);
+    numa_free(L, (size_t)n * n * sizeof(double));
+    numa_free(U, (size_t)n * n * sizeof(double));
     free(piv);
 
     return 0;
