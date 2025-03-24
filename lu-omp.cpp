@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
         std::swap(pi[k], pi[k_]);
 
         // --- Parallel region for updating L, U and trailing submatrix ---
-        #pragma omp parallel default(none) shared(k, n, A, L, U, nworkers)
+        #pragma omp parallel default(none) shared(k, k_, n, A, L, U, nworkers)
         {
             // Step 2: Swap the first k elements of L's rows (for row k and k_).
             #pragma omp single nowait
