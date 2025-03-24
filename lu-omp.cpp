@@ -157,12 +157,14 @@ int main(int argc, char* argv[])
         double maxval = 0.0;
         int maxrow = -1;
 
-        #pragma omp parallel
+        #pragma omp parallel default(none) \
+                     private(local_max, local_row) \
+                     shared(A, n, k, maxval, maxrow)
         {
             double local_max = 0.0;
             int local_row = -1;
 
-            #pragma omp for nowait
+            #pragma omp for
             for (int i = k; i < n; i++) {
                 double val = std::fabs(elem(A, n, i, k));
                 if (val > local_max) {
