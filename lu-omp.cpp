@@ -180,7 +180,6 @@ int main(int argc, char* argv[])
     {
         for (int k = 0; k < n; k++)
         {
-            // If matrix is singular, synchronize and skip further work.
             if (singular) {
                 #pragma omp barrier
                 continue;
@@ -199,13 +198,11 @@ int main(int argc, char* argv[])
                     local_maxrow = i;
                 }
             }
-            // Write the local result to shared temporary arrays.
             thread_maxvals[tid] = local_maxval;
             thread_maxrows[tid] = local_maxrow;
 
-            #pragma omp barrier  // Ensure all threads have written their results.
+            #pragma omp barrier
 
-            // One thread reduces the per-thread results to determine the global pivot.
             double maxval;
             int maxrow;
             #pragma omp single
@@ -220,64 +217,55 @@ int main(int argc, char* argv[])
                     }
                 }
                 if (maxval == 0.0) {
-                    singular = true; // pivot is zero --> singular matrix.
+                    singular = true; // pivot is zero -> singular matrix.
                 } else {
-                    // Swap pivot array entries.
                     int tmpP = piv[k];
-                    piv[k]   = piv[maxrow];
+                    piv[k] = piv[maxrow];
                     piv[maxrow] = tmpP;
 
-                    // Swap rows k and maxrow of A, if needed.
                     if (maxrow != k) {
                         for (int j = 0; j < n; j++) {
                             double tmpA = A[k * n + j];
                             A[k * n + j] = A[maxrow * n + j];
                             A[maxrow * n + j] = tmpA;
                         }
-                        // Swap the partial row of L.
                         for (int j = 0; j < k; j++) {
                             double tmpL = L[k * n + j];
                             L[k * n + j] = L[maxrow * n + j];
                             L[maxrow * n + j] = tmpL;
                         }
                     }
-                    // Set U(k,k) = A(k,k).
                     U[k * n + k] = A[k * n + k];
                 }
             }
-            #pragma omp barrier  // Ensure pivot decision is visible.
+            #pragma omp barrier
 
-            // If singular, skip further updates.
             if (!singular)
             {
                 double pivotVal = A[k * n + k];
-                // Update L(i,k) and U(k,i) for rows i = k+1..n-1.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     L[i * n + k] = A[i * n + k] / pivotVal;
                     U[k * n + i] = A[k * n + i];
                 }
-                // Update the trailing submatrix.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     double lik = L[i * n + k];
-                    double *restrict Arow = &A[i * n];
-                    double *restrict Urow = &U[k * n];
-                    // Use SIMD to vectorize the inner loop.
+                    double* __restrict__ Arow = &A[i * n];
+                    double* __restrict__ Urow = &U[k * n];
                     #pragma omp simd
                     for (int j = k+1; j < n; j++) {
                         Arow[j] -= lik * Urow[j];
                     }
                 }
             }
-            #pragma omp barrier  // Synchronize at the end of iteration k.
+            #pragma omp barrier
         } // end for k
     } // end parallel region
 
     double t_end = omp_get_wtime();
     double factor_time = t_end - t_start;
 
-    // Free the temporary reduction arrays.
     delete[] thread_maxvals;
     delete[] thread_maxrows;
 
@@ -285,21 +273,18 @@ int main(int argc, char* argv[])
         std::cerr << "ERROR: Factorization failed: matrix is singular (pivot = 0).\n";
     }
 
-    // 6) Compute the residual L2,1 norm (only if not singular).
     double l21_norm = 0.0;
     if (!singular) {
         l21_norm = compute_residual_l21_norm(A0, n, piv, L, U);
     }
 
-    // 7) Print results.
     std::cout << "LU factorization time: " << factor_time << " seconds.\n";
     if (!singular) {
         std::cout << "Residual L2,1 norm = " << l21_norm << "\n";
     }
 
-    // Cleanup.
     numa_free(A0, (size_t)n * n * sizeof(double));
-    numa_free(A,  (size_t)n * n * sizeof(double));
+    numa_free(A, (size_t)n * n * sizeof(double));
     free(L);
     free(U);
     free(piv);
