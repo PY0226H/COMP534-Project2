@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --threads-per-core=1
 #SBATCH --exclusive
-#SBATCH --time=00:05:00 
+#SBATCH --time=00:15:00 
 #SBATCH --partition=interactive
 #SBATCH --reservation=comp422
 
