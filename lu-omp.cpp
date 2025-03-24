@@ -1,14 +1,14 @@
 /*************************************************************
  * lu-omp.cpp
  *
- * Improved OpenMP-based LU Decomposition with Partial Pivoting.
+ * Optimized OpenMP-based LU Decomposition with Partial Pivoting.
  * - Uses drand48_r() for thread-safe random number generation.
  * - Single parallel region for improved performance (avoids
  *   repeated creation/teardown of parallel teams).
- * - Each thread computes its local maximum for the pivot search,
- *   and the reduction is performed by a single thread.
- * - Temporary reduction arrays are allocated outside the parallel
- *   region to avoid cross-thread stack accesses.
+ * - Uses pointer arithmetic, restrict qualifiers, and SIMD
+ *   directives to optimize the inner loops.
+ * - Performs pivot search reduction and trailing submatrix update
+ *   efficiently while conforming to the project requirements.
  *************************************************************/
 
 #include <cstdio>
@@ -72,41 +72,39 @@ double* generate_random_matrix(int n, int nthreads) {
     3) Sum_{j=0..n-1} sqrt( sum_{i=0..n-1} R(i,j)^2 ).
 */
 double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, double *U) {
-    // 1) Form P*A
     double *PA = (double*) calloc((size_t)n * n, sizeof(double));
     if (!PA) {
         std::cerr << "ERROR: could not allocate memory for PA.\n";
         exit(EXIT_FAILURE);
     }
+    // Form PA = P*A using the pivot vector.
     for (int i = 0; i < n; i++) {
         int srcRow = piv[i];
-        // Copy row srcRow of Aorig into row i of PA
-        memcpy(&PA[(long)i*n], &Aorig[(long)srcRow*n], n * sizeof(double));
+        memcpy(&PA[(long)i * n], &Aorig[(long)srcRow * n], n * sizeof(double));
     }
 
-    // 2) Compute R = PA - (L*U)
+    // Compute R = PA - L*U.
     double *R = (double*) calloc((size_t)n * n, sizeof(double));
     if (!R) {
         std::cerr << "ERROR: could not allocate memory for R.\n";
         exit(EXIT_FAILURE);
     }
-
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
             double sumLU = 0.0;
             for (int k = 0; k < n; k++) {
-                sumLU += L[(long)i*n + k] * U[(long)k*n + j];
+                sumLU += L[(long)i * n + k] * U[(long)k * n + j];
             }
-            R[(long)i*n + j] = PA[(long)i*n + j] - sumLU;
+            R[(long)i * n + j] = PA[(long)i * n + j] - sumLU;
         }
     }
 
-    // 3) L2,1 norm = sum of Euclidean norms of columns
+    // Compute L2,1 norm = sum of Euclidean norms of columns.
     double l21 = 0.0;
     for (int j = 0; j < n; j++) {
         double sumSq = 0.0;
         for (int i = 0; i < n; i++) {
-            double val = R[(long)i*n + j];
+            double val = R[(long)i * n + j];
             sumSq += val * val;
         }
         l21 += std::sqrt(sumSq);
@@ -123,44 +121,44 @@ int main(int argc, char* argv[])
     if (argc < 3) {
         usage(argv[0]);
     }
-    int n         = std::atoi(argv[1]);  // matrix size
-    int nthreads  = std::atoi(argv[2]);  // number of threads
+    int n = std::atoi(argv[1]);      // matrix size
+    int nthreads = std::atoi(argv[2]); // number of threads
 
     if (n <= 0 || nthreads <= 0) {
         usage(argv[0]);
     }
 
-    // Set number of threads for OpenMP
+    // Set number of threads for OpenMP.
     omp_set_num_threads(nthreads);
 
     std::cout << "Running LU Decomposition with row pivoting on a "
               << n << " x " << n 
               << " matrix using " << nthreads << " threads.\n";
 
-    // 1) Generate random matrix (keep copy for residual check)
+    // 1) Generate random matrix (keep copy for residual check).
     double *A0 = generate_random_matrix(n, nthreads);
 
-    // 2) Copy A0 to A for factorization
-    double *A = (double*) numa_alloc_local((size_t)n * n * sizeof(double));
+    // 2) Copy A0 to A for factorization.
+    double * __restrict__ A = (double* __restrict__) numa_alloc_local((size_t)n * n * sizeof(double));
     if (!A) {
         std::cerr << "ERROR: numa_alloc_local failed for A.\n";
         exit(EXIT_FAILURE);
     }
     memcpy(A, A0, (size_t)n * n * sizeof(double));
 
-    // 3) Allocate L, U
-    double *L = (double*) calloc((size_t)n * n, sizeof(double));
-    double *U = (double*) calloc((size_t)n * n, sizeof(double));
+    // 3) Allocate L, U.
+    double * __restrict__ L = (double* __restrict__) calloc((size_t)n * n, sizeof(double));
+    double * __restrict__ U = (double* __restrict__) calloc((size_t)n * n, sizeof(double));
     if (!L || !U) {
         std::cerr << "ERROR: failed to allocate L or U.\n";
         exit(EXIT_FAILURE);
     }
-    // Initialize L’s diagonal to 1.0
+    // Initialize L’s diagonal to 1.0.
     for (int i = 0; i < n; i++) {
-        L[(long)i*n + i] = 1.0;
+        L[(long)i * n + i] = 1.0;
     }
 
-    // 4) Allocate pivot array
+    // 4) Allocate pivot array.
     int *piv = (int*) malloc(n * sizeof(int));
     if (!piv) {
         std::cerr << "ERROR: failed to allocate pivot array.\n";
@@ -171,12 +169,11 @@ int main(int argc, char* argv[])
     }
 
     // Allocate temporary reduction arrays for pivot search.
-    // These arrays are sized to the number of threads and shared by all threads.
     double *thread_maxvals = new double[nthreads];
     int    *thread_maxrows = new int[nthreads];
 
-    // 5) Perform LU factorization with row pivoting
-    bool singular = false;  // shared flag to detect singular matrix
+    // 5) Perform LU factorization with row pivoting.
+    bool singular = false;  // shared flag to detect singular matrix.
     double t_start = omp_get_wtime();
 
     #pragma omp parallel default(none) shared(A, L, U, piv, n, singular, thread_maxvals, thread_maxrows)
@@ -202,13 +199,13 @@ int main(int argc, char* argv[])
                     local_maxrow = i;
                 }
             }
-            // Write each thread’s local result to the shared arrays.
+            // Write the local result to shared temporary arrays.
             thread_maxvals[tid] = local_maxval;
             thread_maxrows[tid] = local_maxrow;
 
-            #pragma omp barrier  // Ensure all threads have written their results
+            #pragma omp barrier  // Ensure all threads have written their results.
 
-            // One thread performs the reduction.
+            // One thread reduces the per-thread results to determine the global pivot.
             double maxval;
             int maxrow;
             #pragma omp single
@@ -223,7 +220,7 @@ int main(int argc, char* argv[])
                     }
                 }
                 if (maxval == 0.0) {
-                    singular = true; // pivot is zero -> singular matrix
+                    singular = true; // pivot is zero --> singular matrix.
                 } else {
                     // Swap pivot array entries.
                     int tmpP = piv[k];
@@ -233,43 +230,47 @@ int main(int argc, char* argv[])
                     // Swap rows k and maxrow of A, if needed.
                     if (maxrow != k) {
                         for (int j = 0; j < n; j++) {
-                            double tmpA = elem(A, n, k, j);
-                            elem(A, n, k, j) = elem(A, n, maxrow, j);
-                            elem(A, n, maxrow, j) = tmpA;
+                            double tmpA = A[k * n + j];
+                            A[k * n + j] = A[maxrow * n + j];
+                            A[maxrow * n + j] = tmpA;
                         }
                         // Swap the partial row of L.
                         for (int j = 0; j < k; j++) {
-                            double tmpL = L[(long)k*n + j];
-                            L[(long)k*n + j] = L[(long)maxrow*n + j];
-                            L[(long)maxrow*n + j] = tmpL;
+                            double tmpL = L[k * n + j];
+                            L[k * n + j] = L[maxrow * n + j];
+                            L[maxrow * n + j] = tmpL;
                         }
                     }
-                    // Set U(k,k) = A(k,k)
-                    U[(long)k*n + k] = elem(A, n, k, k);
+                    // Set U(k,k) = A(k,k).
+                    U[k * n + k] = A[k * n + k];
                 }
             }
-            #pragma omp barrier  // Ensure pivot decision is visible
+            #pragma omp barrier  // Ensure pivot decision is visible.
 
             // If singular, skip further updates.
             if (!singular)
             {
-                double pivotVal = elem(A, n, k, k);
+                double pivotVal = A[k * n + k];
                 // Update L(i,k) and U(k,i) for rows i = k+1..n-1.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
-                    L[(long)i*n + k] = elem(A, n, i, k) / pivotVal;
-                    U[(long)k*n + i] = elem(A, n, k, i);
+                    L[i * n + k] = A[i * n + k] / pivotVal;
+                    U[k * n + i] = A[k * n + i];
                 }
                 // Update the trailing submatrix.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
-                    double lik = L[(long)i*n + k];
+                    double lik = L[i * n + k];
+                    double *restrict Arow = &A[i * n];
+                    double *restrict Urow = &U[k * n];
+                    // Use SIMD to vectorize the inner loop.
+                    #pragma omp simd
                     for (int j = k+1; j < n; j++) {
-                        elem(A, n, i, j) -= lik * U[(long)k*n + j];
+                        Arow[j] -= lik * Urow[j];
                     }
                 }
             }
-            #pragma omp barrier  // Synchronize at end of iteration k
+            #pragma omp barrier  // Synchronize at the end of iteration k.
         } // end for k
     } // end parallel region
 
@@ -280,24 +281,23 @@ int main(int argc, char* argv[])
     delete[] thread_maxvals;
     delete[] thread_maxrows;
 
-    // If singular, print error.
     if (singular) {
         std::cerr << "ERROR: Factorization failed: matrix is singular (pivot = 0).\n";
     }
 
-    // 6) Compute the residual L2,1 norm (only if not singular)
+    // 6) Compute the residual L2,1 norm (only if not singular).
     double l21_norm = 0.0;
     if (!singular) {
         l21_norm = compute_residual_l21_norm(A0, n, piv, L, U);
     }
 
-    // 7) Print results
+    // 7) Print results.
     std::cout << "LU factorization time: " << factor_time << " seconds.\n";
     if (!singular) {
         std::cout << "Residual L2,1 norm = " << l21_norm << "\n";
     }
 
-    // Cleanup
+    // Cleanup.
     numa_free(A0, (size_t)n * n * sizeof(double));
     numa_free(A,  (size_t)n * n * sizeof(double));
     free(L);
