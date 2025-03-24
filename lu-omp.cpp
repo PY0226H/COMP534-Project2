@@ -2,17 +2,21 @@
  * improved_lu_omp.cpp
  *
  * Improved OpenMP-based LU Decomposition with Partial Pivoting.
- * (Now including residual verification)
+ * (Now including optional residual verification)
  *
  * Key improvements:
  *  - Uses an array-of-pointers (2D layout) for matrices so that
  *    row swapping is done in O(1) time.
  *  - Performs the pivot search serially to reduce synchronization.
  *  - In each iteration, uses a new parallel region with minimal barriers:
- *       • #pragma omp single nowait to swap parts of L and copy pivot row to U.
+ *       • A single-threaded section to swap parts of L and copy the pivot row into U.
  *       • A parallel for loop (with schedule(static,1)) to update the trailing submatrix.
  *  - Uses memcpy to quickly copy the pivot row.
- *  - After the decomposition, computes the residual L2,1 norm of PA - LU.
+ *  - Optionally computes the residual L2,1 norm of (PA - LU) to verify correctness.
+ *
+ * Define ENABLE_VERIFY at compile time (e.g., add -DENABLE_VERIFY) to
+ * enable the verification code. When not defined, the code will run
+ * the LU decomposition and timing without the additional overhead.
  *
  * This code is designed to run efficiently for matrix sizes from 1000 to 8000
  * and thread counts from 1 to 32.
@@ -99,21 +103,24 @@ int main(int argc, char** argv) {
     // Initialize matrices A, L, U, and pivot array.
     init_matrix(A, L, U, pi, n, nworkers);
 
-    // *** New: Create a copy of the original A for residual verification ***
+#ifdef ENABLE_VERIFY
+    // --- Optional: Create a copy of the original A for residual verification ---
+    // This extra allocation is done outside the timed region.
     double **A_orig = new double*[n];
     for (int i = 0; i < n; i++) {
-        A_orig[i] = new double[n];  // standard allocation
+        A_orig[i] = new double[n];  // Standard allocation (since performance here is not critical)
         memcpy(A_orig[i], A[i], sizeof(double) * n);
     }
+#endif
 
-    // Start the timer.
+    // Start the timer for the LU decomposition phase.
     timer_start();
 
-    // LU Decomposition with partial pivoting.
+    // --- LU Decomposition with partial pivoting ---
     for (int k = 0; k < n; k++) {
         double max_val = 0.0;
         int k_ = k;
-        // --- Serial pivot search ---
+        // Serial pivot search for the maximum absolute value in column k.
         for (int i = k; i < n; i++) {
             double abs_val = fabs(A[i][k]);
             if (abs_val > max_val) {
@@ -125,25 +132,24 @@ int main(int argc, char** argv) {
             std::cerr << "Matrix is singular at column " << k << "\n";
             exit(EXIT_FAILURE);
         }
-        // --- Swap rows in A (O(1) pointer swap) ---
+        // Swap rows in A (O(1) pointer swap) and update pivot array.
         std::swap(A[k], A[k_]);
-        // Also swap pivot indices.
         std::swap(pi[k], pi[k_]);
 
-        // --- Parallel region for updating L, U, and trailing submatrix ---
+        // Parallel region for updating L, U, and trailing submatrix.
         #pragma omp parallel default(none) shared(k, k_, n, A, L, U)
         {
-            // Step 2: Swap the first k elements of L's rows k and k_.
+            // Swap the first k elements of rows k and k_ in L.
             #pragma omp single nowait
             {
                 std::swap_ranges(L[k], L[k] + k, L[k_]);
             }
-            // Step 3: Copy A[k][k:] into U[k][k:] using memcpy.
+            // Copy the pivot row from A to U for columns k to n-1.
             #pragma omp single nowait
             {
                 memcpy(&U[k][k], &A[k][k], sizeof(double) * (n - k));
             }
-            // Step 4: Update rows i = n-1 downto k+1.
+            // Update trailing submatrix rows: for i = k+1 to n-1.
             #pragma omp for nowait schedule(static,1)
             for (int i = n - 1; i > k; i--) {
                 double tmp = A[i][k] / A[k][k];
@@ -158,19 +164,23 @@ int main(int argc, char** argv) {
     double elapsed = timer_elapsed();
     std::cout << "LU decomposition time: " << elapsed << " seconds.\n";
 
+#ifdef ENABLE_VERIFY
     // --- Residual Verification ---
-    // Compute the residual matrix R = PA - L*U and calculate its L2,1 norm.
-    // PA is obtained by permuting the rows of the original matrix A_orig according to the pivot vector pi.
+    // Compute the residual matrix R = PA - L*U and its L2,1 norm.
+    // Here, PA is obtained by permuting the rows of the original matrix A_orig according to the pivot array.
     double l21_norm = 0.0;
+    // Note: This verification is serial and may be slow for very large n.
     for (int j = 0; j < n; j++) {
         double col_norm_sq = 0.0;
         for (int i = 0; i < n; i++) {
             double prod = 0.0;
+            // Because L is lower-triangular and U is upper-triangular,
+            // the effective summation is over k = 0 to min(i,j)
             int k_end = std::min(i, j);
             for (int k = 0; k <= k_end; k++) {
                 prod += L[i][k] * U[k][j];
             }
-            // A_orig[pi[i]] is the original row that ended up as row i of PA.
+            // A_orig[pi[i]] is the original row that was permuted into row i of PA.
             double diff = A_orig[pi[i]][j] - prod;
             col_norm_sq += diff * diff;
         }
@@ -183,6 +193,7 @@ int main(int argc, char** argv) {
         delete[] A_orig[i];
     }
     delete[] A_orig;
+#endif
 
     // Free allocated memory for matrices and pivot vector.
     free_matrix(A, n);
