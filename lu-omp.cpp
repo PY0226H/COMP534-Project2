@@ -1,11 +1,14 @@
 /*************************************************************
  * lu-omp.cpp
  *
- * OpenMP-based LU Decomposition with Partial Pivoting.
+ * Improved OpenMP-based LU Decomposition with Partial Pivoting.
  * - Uses drand48_r() for thread-safe random number generation.
  * - Single parallel region for improved performance (avoids
  *   repeated creation/teardown of parallel teams).
- * - Avoids referencing std::cerr inside parallel with default(none).
+ * - Improved pivot search: each thread computes a local maximum
+ *   for the current column, and a single thread reduces these
+ *   results to choose the global pivot.
+ * - Avoids data races that were detected by Intel Inspector.
  *************************************************************/
 
 #include <cstdio>
@@ -47,7 +50,7 @@ double* generate_random_matrix(int n, int nthreads) {
     #pragma omp parallel num_threads(nthreads)
     {
         struct drand48_data randBuf;
-        // seed each thread's generator differently
+        // Seed each thread's generator differently
         srand48_r(2023 + 37 * omp_get_thread_num(), &randBuf);
 
         #pragma omp for schedule(static)
@@ -61,7 +64,7 @@ double* generate_random_matrix(int n, int nthreads) {
 }
 
 /*
-  Compute the L2,1 norm (sum of Euclidian norms of columns) of (P*A - L*U).
+  Compute the L2,1 norm (sum of Euclidean norms of columns) of (P*A - L*U).
 
   Steps:
     1) Form PA by permuting rows of A according to piv.
@@ -98,7 +101,7 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
         }
     }
 
-    // 3) L2,1 norm = sum of Euclidian norms of columns
+    // 3) L2,1 norm = sum of Euclidean norms of columns
     double l21 = 0.0;
     for (int j = 0; j < n; j++) {
         double sumSq = 0.0;
@@ -171,37 +174,34 @@ int main(int argc, char* argv[])
     bool singular = false;  // shared flag to detect singular matrix
     double t_start = omp_get_wtime();
 
-    #pragma omp parallel default(none) \
-                         shared(A, L, U, piv, n, singular)
+    // Parallel region: all threads execute the LU factorization in lock-step.
+    #pragma omp parallel default(none) shared(A, L, U, piv, n, singular)
     {
-        // These static variables are used for pivot search
-        static double maxval;
-        static int    maxrow;
-
-        // Per-thread local pivot search
-        double local_maxval;
-        int    local_maxrow;
+        // Allocate thread-local arrays (one per thread) to store pivot search results.
+        int num_threads = omp_get_num_threads();
+        double *thread_maxvals = nullptr;
+        int *thread_maxrows = nullptr;
+        #pragma omp single
+        {
+            thread_maxvals = new double[num_threads];
+            thread_maxrows = new int[num_threads];
+        }
+        #pragma omp barrier  // ensure allocation is complete
 
         for (int k = 0; k < n; k++)
         {
-            // If matrix is already found singular, skip rest
+            // Check for singular matrix; if found, all threads skip further work.
             if (singular) {
                 #pragma omp barrier
                 continue;
             }
 
-            // Let a single thread reset pivot info
-            #pragma omp single
-            {
-                maxval = 0.0;
-                maxrow = -1;
-            }
-            #pragma omp barrier
+            // Each thread prepares its local variables for pivot search.
+            int tid = omp_get_thread_num();
+            double local_maxval = 0.0;
+            int local_maxrow = k;
 
-            // Each thread searches portion of column k for largest absolute value
-            local_maxval = 0.0;
-            local_maxrow = k;
-
+            // Each thread searches its assigned chunk of the column for the largest absolute value.
             #pragma omp for nowait
             for (int i = k; i < n; i++) {
                 double val = std::fabs(elem(A, n, i, k));
@@ -210,61 +210,64 @@ int main(int argc, char* argv[])
                     local_maxrow = i;
                 }
             }
+            // Store the thread's local result.
+            thread_maxvals[tid] = local_maxval;
+            thread_maxrows[tid] = local_maxrow;
 
-            // Combine local results into global pivot choice
-            #pragma omp critical
-            {
-                if (local_maxval > maxval) {
-                    maxval = local_maxval;
-                    maxrow = local_maxrow;
-                }
-            }
-            #pragma omp barrier
+            #pragma omp barrier  // ensure all threads have written their results
 
-            // One thread checks for singular, performs pivot row swap
+            // One thread reduces the per-thread results to determine the global pivot.
+            double maxval;
+            int maxrow;
             #pragma omp single
             {
+                maxval = 0.0;
+                maxrow = k;
+                for (int t = 0; t < num_threads; t++) {
+                    if (thread_maxvals[t] > maxval) {
+                        maxval = thread_maxvals[t];
+                        maxrow = thread_maxrows[t];
+                    }
+                }
                 if (maxval == 0.0) {
-                    singular = true; // set the flag
+                    singular = true; // set the flag if the pivot is zero
                 } else {
-                    // Swap pivot array entries
+                    // Swap pivot array entries.
                     int tmpP = piv[k];
                     piv[k]   = piv[maxrow];
                     piv[maxrow] = tmpP;
 
-                    // Swap rows k and maxrow of A
+                    // Swap rows k and maxrow of A, if needed.
                     if (maxrow != k) {
                         for (int j = 0; j < n; j++) {
                             double tmpA = elem(A, n, k, j);
                             elem(A, n, k, j) = elem(A, n, maxrow, j);
                             elem(A, n, maxrow, j) = tmpA;
                         }
-                        // Swap partial row of L
+                        // Swap the partial row of L.
                         for (int j = 0; j < k; j++) {
                             double tmpL = L[(long)k*n + j];
                             L[(long)k*n + j] = L[(long)maxrow*n + j];
                             L[(long)maxrow*n + j] = tmpL;
                         }
                     }
-
-                    // U(k,k) = A(k,k)
+                    // Set U(k,k) = A(k,k)
                     U[(long)k*n + k] = elem(A, n, k, k);
                 }
             }
-            #pragma omp barrier
+            #pragma omp barrier  // ensure pivot decision is visible
 
-            // If singular found, skip updating
+            // If singular, skip further updating.
             if (!singular)
             {
-                // For i=k+1..n-1, set L(i,k) and U(k,i)
                 double pivotVal = elem(A, n, k, k);
+                // Update L(i,k) and U(k,i) for i = k+1..n-1.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     L[(long)i*n + k] = elem(A, n, i, k) / pivotVal;
                     U[(long)k*n + i] = elem(A, n, k, i);
                 }
-
-                // Update the trailing submatrix
+                // Update the trailing submatrix.
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     double lik = L[(long)i*n + k];
@@ -273,18 +276,23 @@ int main(int argc, char* argv[])
                     }
                 }
             }
-            #pragma omp barrier
+            #pragma omp barrier  // synchronize at the end of iteration k
         } // end for k
+
+        // Free the thread-local arrays.
+        #pragma omp single
+        {
+            delete[] thread_maxvals;
+            delete[] thread_maxrows;
+        }
     } // end parallel region
 
     double t_end = omp_get_wtime();
     double factor_time = t_end - t_start;
 
-    // If singular, print error and optionally exit
+    // If singular, print error.
     if (singular) {
-        std::cerr << "ERROR: Factorization failed: matrix is singular (pivot = 0). \n";
-        // If you'd like to stop the program here:
-        // exit(EXIT_FAILURE);
+        std::cerr << "ERROR: Factorization failed: matrix is singular (pivot = 0).\n";
     }
 
     // 6) Compute the residual L2,1 norm (only if not singular)
