@@ -1,12 +1,15 @@
 /*************************************************************
  * lu-omp.cpp
  *
- * Simpler OpenMP-based LU Decomposition with Partial Pivoting
- * for smaller problem sizes and low thread counts.
- * Key changes from your version:
- *  - Removed manual blocking (tiling).
- *  - Simplified trailing submatrix update loop.
- *  - Optionally uses schedule(dynamic) for better load balance with 2 threads.
+ * Improved OpenMP-based LU Decomposition with Partial Pivoting.
+ * Key features:
+ *  - Single-thread pivot search to reduce overhead.
+ *  - One parallel region with minimal barriers.
+ *  - Vectorized trailing submatrix update with #pragma omp simd.
+ *  - No manual tiling (blocking).
+ *  - NUMA-aware allocations for large arrays (A, L, U).
+ *  - Valid for n=1000..8000 and 1..32 threads, but may need
+ *    increased walltime for largest cases on few threads.
  *************************************************************/
 
 #include <cstdio>
@@ -63,10 +66,12 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
         std::cerr << "ERROR: could not allocate memory for PA.\n";
         exit(EXIT_FAILURE);
     }
+    // Form PA
     for (int i = 0; i < n; i++) {
         int srcRow = piv[i];
         memcpy(&PA[(long)i * n], &Aorig[(long)srcRow * n], n * sizeof(double));
     }
+    // Compute R = PA - L*U
     double *R = (double*) calloc((size_t)n * n, sizeof(double));
     if (!R) {
         std::cerr << "ERROR: could not allocate memory for R.\n";
@@ -81,6 +86,7 @@ double compute_residual_l21_norm(double *Aorig, int n, int *piv, double *L, doub
             R[(long)i * n + j] = PA[(long)i * n + j] - sumLU;
         }
     }
+    // Compute L2,1 norm
     double l21 = 0.0;
     for (int j = 0; j < n; j++) {
         double sumSq = 0.0;
@@ -146,92 +152,63 @@ int main(int argc, char* argv[])
         piv[i] = i;
     }
 
-    // Temporary arrays for pivot search reduction.
-    double *thread_maxvals = new double[nthreads];
-    int    *thread_maxrows = new int[nthreads];
-
-    // 5) LU factorization with row pivoting.
+    // 5) LU factorization with row pivoting (single-thread pivot search).
     bool singular = false;
     double t_start = omp_get_wtime();
 
-    #pragma omp parallel default(none) \
-                         shared(A, L, U, piv, n, singular, thread_maxvals, thread_maxrows)
+    #pragma omp parallel default(none) shared(A, L, U, piv, n, singular)
     {
         for (int k = 0; k < n; k++) {
             if (singular) {
-                // If we already know the matrix is singular, skip the rest quickly.
+                // If pivot is zero, skip rest quickly.
                 #pragma omp barrier
                 continue;
             }
-
-            int tid = omp_get_thread_num();
-            double local_maxval = 0.0;
-            int local_maxrow = k;
-
-            // --- Parallel pivot search ---
-            #pragma omp for nowait
-            for (int i = k; i < n; i++) {
-                double val = std::fabs(A[(long)i * n + k]);
-                if (val > local_maxval) {
-                    local_maxval = val;
-                    local_maxrow = i;
-                }
-            }
-            thread_maxvals[tid] = local_maxval;
-            thread_maxrows[tid] = local_maxrow;
-            #pragma omp barrier
-
-            // --- Combine pivot search results ---
-            double maxval = 0.0;
-            int maxrow = k;
+            // --- Single-thread pivot search + row swap ---
             #pragma omp single
             {
-                int num_threads = omp_get_num_threads();
-                for (int t = 0; t < num_threads; t++) {
-                    if (thread_maxvals[t] > maxval) {
-                        maxval = thread_maxvals[t];
-                        maxrow = thread_maxrows[t];
+                // Find pivot row in [k..n-1]
+                double maxval = 0.0;
+                int maxrow = k;
+                for (int i = k; i < n; i++) {
+                    double val = std::fabs(A[(long)i * n + k]);
+                    if (val > maxval) {
+                        maxval = val;
+                        maxrow = i;
                     }
                 }
                 if (maxval == 0.0) {
+                    // Singular matrix
                     singular = true;
                 } else {
-                    // Swap pivot entries.
+                    // Swap pivot array
                     std::swap(piv[k], piv[maxrow]);
-
-                    // Swap rows in A.
+                    // Swap rows in A
                     if (maxrow != k) {
                         for (int j = 0; j < n; j++) {
                             std::swap(A[k*n + j], A[maxrow*n + j]);
                         }
-                        // Swap the first k entries of L.
+                        // Swap the first k entries of L
                         for (int j = 0; j < k; j++) {
                             std::swap(L[k*n + j], L[maxrow*n + j]);
                         }
                     }
+                    // Set U(k,k)
+                    U[k*n + k] = A[k*n + k];
                 }
-            }
-            #pragma omp barrier
+            } // end single
 
+            // Implicit barrier at end of single
             if (!singular) {
-                // --- Update L and U for pivot row/column ---
-                double pivotVal = A[k*n + k];
-                #pragma omp single
-                {
-                    U[k*n + k] = pivotVal;
-                }
-
-                // Fill L(i,k) and U(k,i) for i>k
+                // --- Update L(i,k) and U(k,i) in parallel ---
                 #pragma omp for
                 for (int i = k+1; i < n; i++) {
-                    L[i*n + k] = A[i*n + k] / pivotVal;
+                    L[i*n + k] = A[i*n + k] / A[k*n + k];
                     U[k*n + i] = A[k*n + i];
                 }
 
-                // --- Trailing submatrix update ---
-                // We'll do i in parallel, j in simd.
-                // Optionally use schedule(dynamic) to help 2-thread balance.
-                #pragma omp for schedule(dynamic)
+                // --- Update trailing submatrix: A(i,j) -= L(i,k)*U(k,j) ---
+                #pragma omp for
                 for (int i = k+1; i < n; i++) {
                     double lik = L[i*n + k];
                     double *Arow = &A[i*n];
@@ -242,15 +219,12 @@ int main(int argc, char* argv[])
                     }
                 }
             }
-            #pragma omp barrier
+            // Implicit barrier at end of for
         } // end for k
     } // end parallel region
 
     double t_end = omp_get_wtime();
     double factor_time = t_end - t_start;
-
-    delete[] thread_maxvals;
-    delete[] thread_maxrows;
 
     if (singular) {
         std::cerr << "ERROR: Factorization failed: matrix is singular (pivot = 0).\n";
